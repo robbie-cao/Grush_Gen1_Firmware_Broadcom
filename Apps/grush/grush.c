@@ -47,6 +47,9 @@
 #include "platform.h"
 #include "grush.h"
 #include "spar_utils.h"
+#include "puart.h"
+#include "ring_buffer.h"
+#include "devicelpm.h"
 
 /******************************************************
  *                      Constants
@@ -82,6 +85,12 @@ const UINT8 oob_tk[LESMP_MAX_KEY_SIZE] =  {0x41, 0x59, 0x1c, 0xd5, 0xea, 0x5a, 0
 const UINT8 passKey[LESMP_MAX_KEY_SIZE] = {0x40, 0xE2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 #endif
 
+#define PACKET_DEBUG    (1)
+#define PACKET_QUAT     (2)
+#define PACKET_DATA     (3)
+#define PACKET_VOLTAGE  (4)
+#define PACKET_BLE  	(5)
+#define PACKET_LENGTH   (23)			// max length of data to BLE
 
 /******************************************************
  *                     Structures
@@ -115,8 +124,11 @@ static void grush_encryption_changed( HCI_EVT_HDR *evt );
 static void grush_send_message( void );
 static int  grush_write_handler( LEGATTDB_ENTRY_HDR *p );
 static void grush_indication_cfm( void );
-static void grush_interrupt_handler( UINT8 value );
 extern void bleprofile_appTimerCb( UINT32 arg );
+
+void application_puart_interrupt_callback(void);
+
+UINT32 application_time_to_sleep_callback(LowPowerModePollType type, UINT32 context);
 
 /******************************************************
  *               Variables Definitions
@@ -234,7 +246,7 @@ const BLE_PROFILE_CFG grush_cfg =
     /*.low_direct_adv_interval        =*/ 0,    // seconds
     /*.high_direct_adv_duration       =*/ 0,    // seconds
     /*.low_direct_adv_duration        =*/ 0,    // seconds
-    /*.local_name                     =*/ "Hello",        // [LOCAL_NAME_LEN_MAX];
+    /*.local_name                     =*/ "Brush",        // [LOCAL_NAME_LEN_MAX];
     /*.cod                            =*/ BIT16_TO_8(APPEARANCE_GENERIC_TAG),0x00, // [COD_LEN];
     /*.ver                            =*/ "1.00",         // [VERSION_LEN];
     /*.encr_required                  =*/ (SECURITY_ENABLED | SECURITY_REQUEST),    // data encrypted and device sends security request on every connection
@@ -298,7 +310,7 @@ const BLE_PROFILE_GPIO_CFG grush_gpio_cfg =
 
 UINT32 	grush_timer_count        = 0;
 UINT32 	grush_fine_timer_count   = 0;
-UINT16 	grush_connection_handle	= 0;	// HCI handle of connection, not zero when connected
+UINT16 	grush_connection_handle	 = 0;	// HCI handle of connection, not zero when connected
 BD_ADDR grush_remote_addr        = {0, 0, 0, 0, 0, 0};
 UINT8 	grush_indication_sent    = 0;	// indication sent, waiting for ack
 UINT8   grush_data_to_send       = 0;  	// Number of messages we need to send
@@ -306,6 +318,10 @@ UINT8   grush_stay_connected	 = 1;	// Change that to 0 to disconnect when all me
 
 // NVRAM save area
 HOSTINFO grush_hostinfo = {.characteristic_client_configuration = 1};
+
+#define UART_BUFFER_SIZE		64
+static char buffer[UART_BUFFER_SIZE];
+static ring_buffer_t uart_buffer;
 
 /******************************************************
  *               Function Definitions
@@ -321,7 +337,7 @@ APPLICATION_INIT()
                    (void *)&grush_gpio_cfg,
                    grush_create);
 
-    // BLE_APP_DISABLE_TRACING();     ////// Uncomment to disable all tracing
+    //BLE_APP_DISABLE_TRACING();     ////// Uncomment to disable all tracing
 }
 
 // Create hello sensor
@@ -347,6 +363,32 @@ void grush_create(void)
     bleprofile_regAppEvtHandler(BLECM_APP_EVT_LINK_UP, grush_connection_up);
     bleprofile_regAppEvtHandler(BLECM_APP_EVT_LINK_DOWN, grush_connection_down);
     bleprofile_regAppEvtHandler(BLECM_APP_EVT_ADV_TIMEOUT, grush_advertisement_stopped);
+
+    // init ring buffer for uart input
+    ring_buffer_init(&uart_buffer, buffer, UART_BUFFER_SIZE);
+
+    // Set the baud rate we want to use. Default is 115200.
+    //extern puart_UartConfig puart_config;
+    //puart_config.baudrate = 19200;
+
+    puart_init();
+    puart_enableTx();
+    // clear interrupt
+    P_UART_INT_CLEAR(P_UART_ISR_RX_AFF_MASK);
+    // set watermark to 1 byte - will interrupt on every byte received.
+    P_UART_WATER_MARK_RX_LEVEL(1);
+    // enable UART interrupt in the Main Interrupt Controller and RX Almost Full in the UART
+    // Interrupt Controller
+    P_UART_INT_ENABLE |= P_UART_ISR_RX_AFF_MASK;
+    // Set callback function to app callback function.
+    bleprofile_PUARTRegisterRxHandler(application_puart_interrupt_callback);
+    //puart_bleRxCb = application_puart_interrupt_callback;
+    // Enable the CPU level interrupt
+    puart_enableInterrupt();
+
+    // NOTE: UART recv does not work in sleep and deep sleep modes, so must register a callback to
+    // disable both modes!!
+    devlpm_registerForLowPowerQueries(application_time_to_sleep_callback, 0);
 
 #if defined OOB_PAIRING || defined PASSKEY_PAIRING
     // setup the pairing parameters.
@@ -484,8 +526,7 @@ void grush_connection_up(void)
     bda =(UINT8 *)emconninfo_getPeerPubAddr();
 
     memcpy(grush_hostinfo.bdaddr, bda, sizeof(BD_ADDR));
-    grush_hostinfo.characteristic_client_configuration = 0;
-    grush_hostinfo.number_of_blinks = 0;
+    grush_hostinfo.characteristic_client_configuration = 1;
 
 	writtenbyte = bleprofile_WriteNVRAM(NVRAM_ID_HOST_LIST, sizeof(grush_hostinfo), (UINT8 *)&grush_hostinfo);
     ble_trace1("NVRAM write:%04x\n", writtenbyte);
@@ -535,7 +576,7 @@ void grush_advertisement_stopped(void)
 
 void grush_timeout(UINT32 arg)
 {
-    ble_trace2("grush_timeout:%d %d\n", grush_timer_count, grush_fine_timer_count);
+    ble_trace1("grush_timeout:%d\n", grush_timer_count);
 
     switch(arg)
     {
@@ -549,50 +590,105 @@ void grush_timeout(UINT32 arg)
 
 void grush_fine_timeout(UINT32 arg)
 {
-    grush_fine_timer_count++;
+	static char data_started = 0;
+    static char data[PACKET_LENGTH + 1];
+    static char data_index = 0;
+    static char data_completed = 0;
 
-    char data[READ_UART_LEN + 1];
-    memset(data, 0x0, READ_UART_LEN + 1);
+    ble_trace1("grush_fine_timeout:%d ", grush_fine_timer_count++);
 
-    // read uart
-    bleprofile_ReadUART(data);
-
-    if (data[0] == 'A') {
-    	ble_trace0("To shutdown\n");
-    	// host will shutdown, anything for us to do?
-    	grush_stay_connected = 0;
-    } else {
-        ble_trace0("Data recved\n");
-		BLEPROFILE_DB_PDU db_pdu;
-		memcpy(db_pdu.pdu, data, READ_UART_LEN);
-		db_pdu.len = 16;
-		bleprofile_WriteHandle(HANDLE_GRUSH_VALUE_NOTIFY, &db_pdu);
-
-		grush_data_to_send = 1;
-
-		if (grush_connection_handle == 0)
-		{
-			bleprofile_Discoverable(HIGH_UNDIRECTED_DISCOVERABLE, grush_remote_addr);
-
-			ble_trace2("ADV start high: %08x%04x\n",
-						(grush_hostinfo.bdaddr[5] << 24) + (grush_hostinfo.bdaddr[4] << 16) +
-						(grush_hostinfo.bdaddr[3] << 8) + grush_hostinfo.bdaddr[2],
-						(grush_hostinfo.bdaddr[1] << 8) + grush_hostinfo.bdaddr[0]);
-			return;
-		}
-		// Connection is up. Send message if client is registered to receive indication
-		//  or notification.  After we sent an indication we need to wait for the ack before
-		// we can send anything else
-		if (!grush_indication_sent)
-		{
-			grush_send_message();
-			grush_data_to_send = 0;
+    while (1) {
+		if (!data_started) {
+			// find the '$' sign, which is the staring char of a valid data packet
+			char byte;
+			while (ring_buffer_read_byte(&uart_buffer, &byte) == 1 && byte != '$')
+				;
+			if (byte == '$') {
+				data[0] = '$';
+				data_started = 1;
+				data_index = 1;
+				data_completed = 0;
+			} else {
+				// nothing left in uart buffer
+				break;
+			}
 		}
 
-		// if we sent all messages, start connection idle timer to disconnect
-		if (!grush_stay_connected && !grush_indication_sent)
-		{
-			bleprofile_StartConnIdleTimer(bleprofile_p_cfg->con_idle_timeout, bleprofile_appTimerCb);
+		if (data_started) {
+			char byte;
+			while (ring_buffer_read_byte(&uart_buffer, &byte) == 1 && data_index < PACKET_LENGTH) {
+				data[data_index++] = byte;
+				if (data_index > 3 && data[data_index - 2] == '\r' && data[data_index - 1] == '\n') {
+					// we have complete reading a packet
+					data_completed = 1;
+					data_started = 0;
+					break;
+				}
+			}
+		}
+
+		if (!data_completed) {
+			if (data_index == PACKET_LENGTH) {
+				// something wrong in the uart data
+				data_started = 0;
+				data_index = 0;
+			}
+			break;
+		} else {
+			// print the packet
+			//ble_trace1("data_len: %d\n", data_index);
+			//ble_tracen(data, data_index);
+
+			if (data[1] == PACKET_BLE) {
+				ble_trace0("To shutdown\n");
+				// host will shutdown, anything for us to do?
+				grush_stay_connected = 0;
+			} else if (data[1] == PACKET_QUAT) {
+				// quaternion data
+				ble_trace0("Quat recved\n");
+
+				BLEPROFILE_DB_PDU db_pdu;
+				memcpy(db_pdu.pdu, &data[3], 16);
+				db_pdu.len = 16;
+				ble_tracen(db_pdu.pdu, db_pdu.len);
+				bleprofile_WriteHandle(HANDLE_GRUSH_VALUE_NOTIFY, &db_pdu);
+
+				grush_data_to_send = 1;
+
+				if (grush_connection_handle == 0)
+				{
+					bleprofile_Discoverable(HIGH_UNDIRECTED_DISCOVERABLE, grush_remote_addr);
+					ble_trace2("ADV start high: %08x%04x\n",
+								(grush_hostinfo.bdaddr[5] << 24) + (grush_hostinfo.bdaddr[4] << 16) +
+								(grush_hostinfo.bdaddr[3] << 8) + grush_hostinfo.bdaddr[2],
+								(grush_hostinfo.bdaddr[1] << 8) + grush_hostinfo.bdaddr[0]);
+					return;
+				}
+				// Connection is up. Send message if client is registered to receive indication
+				//  or notification.  After we sent an indication we need to wait for the ack before
+				// we can send anything else
+				if (!grush_indication_sent)
+				{
+					grush_send_message();
+					grush_data_to_send = 0;
+				}
+
+				// if we sent all messages, start connection idle timer to disconnect
+				if (!grush_stay_connected && !grush_indication_sent)
+				{
+					bleprofile_StartConnIdleTimer(bleprofile_p_cfg->con_idle_timeout, bleprofile_appTimerCb);
+				}
+			} else if (data[1] == PACKET_VOLTAGE) {
+				ble_trace0("Voltage recved\n");
+				// battery voltage
+				BLEPROFILE_DB_PDU db_pdu;
+				memcpy(db_pdu.pdu, data[2], 1);
+				db_pdu.len = 1;
+				bleprofile_WriteHandle(0x0063, &db_pdu);
+			}
+
+			data_completed = 0;
+			data_index = 0;
 		}
     }
 }
@@ -604,7 +700,7 @@ void grush_fine_timeout(UINT32 arg)
 //
 void grush_smp_bond_result(LESMP_PARING_RESULT  result)
 {
-    ble_trace3("hello_sample, bond result %02x smpinfo addr type:%d emconninfo type:%d\n",
+    ble_trace3("brush, bond result %02x smpinfo addr type:%d emconninfo type:%d\n",
     		result, lesmp_pinfo->lesmpkeys_bondedInfo.adrType, emconninfo_getPeerAddrType());
 
 
@@ -620,8 +716,7 @@ void grush_smp_bond_result(LESMP_PARING_RESULT  result)
         bda = (UINT8 *)emconninfo_getPeerPubAddr();
 
         memcpy(grush_hostinfo.bdaddr, bda, sizeof(BD_ADDR));
-        grush_hostinfo.characteristic_client_configuration = 0;
-        grush_hostinfo.number_of_blinks = 0;
+        grush_hostinfo.characteristic_client_configuration = 1;
 
         ble_trace2("Bond successful %08x%04x\n", (bda[5] << 24) + (bda[4] << 16) + (bda[3] << 8) + bda[2], (bda[1] << 8) + bda[0]);
         writtenbyte = bleprofile_WriteNVRAM(NVRAM_ID_HOST_LIST, sizeof(grush_hostinfo), (UINT8 *)&grush_hostinfo);
@@ -659,12 +754,11 @@ void grush_encryption_changed(HCI_EVT_HDR *evt)
 
 	bleprofile_WriteHandle(HANDLE_GRUSH_CLIENT_CONFIGURATION_DESCRIPTOR, &db_pdu);
 
-    ble_trace4("EncOn %08x%04x client_configuration:%04x blinks:%d\n",
+    ble_trace3("EncOn %08x%04x client_configuration:%04x\n",
                 (grush_hostinfo.bdaddr[5] << 24) + (grush_hostinfo.bdaddr[4] << 16) +
                 (grush_hostinfo.bdaddr[3] << 8) + grush_hostinfo.bdaddr[2],
                 (grush_hostinfo.bdaddr[1] << 8) + grush_hostinfo.bdaddr[0],
-                grush_hostinfo.characteristic_client_configuration,
-                grush_hostinfo.number_of_blinks);
+                grush_hostinfo.characteristic_client_configuration);
 
     // If there are outstanding messages that we could not send out because
     // connection was not up and/or encrypted, send them now.  If we are sending
@@ -694,6 +788,8 @@ void grush_encryption_changed(HCI_EVT_HDR *evt)
 void grush_send_message(void)
 {
     BLEPROFILE_DB_PDU db_pdu;
+
+    ble_trace1("configuration %d\n", grush_hostinfo.characteristic_client_configuration);
 
     // If client has not registered for indication or notification, do not need to do anything
     if (grush_hostinfo.characteristic_client_configuration == 0)
@@ -808,4 +904,51 @@ void bleprofile_SendConnParamUpdateReq(UINT16 minInterval, UINT16 maxInterval, U
         return;
 
     lel2cap_sendConnParamUpdateReq(minInterval, maxInterval, slaveLatency, timeout);
+}
+
+// Application thread context uart interrupt handler.
+// unused - Unused parameter.
+void application_puart_interrupt_callback(void)
+{
+	// There can be at most 16 bytes in the HW FIFO.
+	char readbytes[16];
+	UINT8 number_of_bytes_read = 0;
+	// empty the FIFO
+	while(puart_rxFifoNotEmpty() && puart_read(&readbytes[number_of_bytes_read]))
+	{
+		number_of_bytes_read++;
+	}
+
+	// readbytes should have number_of_bytes_read bytes of data read from puart. Do something with this.
+	ring_buffer_write(&uart_buffer, readbytes, number_of_bytes_read);
+
+	// clear the interrupt
+	P_UART_INT_CLEAR(P_UART_ISR_RX_AFF_MASK);
+	// enable UART interrupt in the Main Interrupt Controller and RX Almost Full in the UART Interrupt Controller
+	P_UART_INT_ENABLE |= P_UART_ISR_RX_AFF_MASK;
+}
+
+UINT32 application_time_to_sleep_callback(LowPowerModePollType type, UINT32 context)
+{
+	switch(type)
+	{
+		case LOW_POWER_MODE_POLL_TYPE_SLEEP:
+		// System wants to sleep. Return how long the system can sleep in microseconds.
+		// Sleep times under ~3.75mS may be ignored. Guaranteed to sleep for not more
+		// than the time returned by this function. May sleep for less than this if
+		// other subsystems in the FW return a time less than this return value.
+		// To disable sleep, return 0; to leave the decision to some other subsystem
+		// (typically when advertising/connected, the BT sub-system will ensure wake
+		// at the right time), return ~0 (this is the default if the app does not register
+		// for this callback).
+			return 0;		// Disable sleep.
+		case LOW_POWER_MODE_POLL_TYPE_POWER_OFF:
+		// System wants to enter deep sleep. Return 0 to disable deep sleep or any non-zero
+		// value to indicate OK to enter deep sleep. Returning 0 will guarantee that deep
+		// sleep is not entered. Device may not enter deep sleep even when the application
+		// allows deep sleep because some other subsystem disabled it.
+			return 0;		// Disable deep sleep.
+		default:
+			return ~0;
+	}
 }
