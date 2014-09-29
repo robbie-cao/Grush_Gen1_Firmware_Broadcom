@@ -235,7 +235,7 @@ const UINT8 grush_gatt_database[]=
 
 const BLE_PROFILE_CFG grush_cfg =
 {
-    /*.fine_timer_interval            =*/ 50, // ms
+    /*.fine_timer_interval            =*/ 10, // ms
     /*.default_adv                    =*/ 4,    // HIGH_UNDIRECTED_DISCOVERABLE
     /*.button_adv_toggle              =*/ 0,    // pairing button make adv toggle (if 1) or always on (if 0)
     /*.high_undirect_adv_interval     =*/ 32,   // slots
